@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::panic;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -471,9 +471,69 @@ fn print_status_box(state: &LiveGameState, state_desc: &str, details_desc: &str)
     let _ = handle.flush();
 }
 
+// Embedded application icon: assets/img/app/icon.png
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/img/app/icon.png");
+
+// Ensure embedded icon is written to a reliable cache path for hosts using icon_theme_path
+fn ensure_icon_cache() -> Option<String> {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            std::path::PathBuf::from(home).join(".cache")
+        });
+    let icon_dir = base.join("delta-rpc").join("icons");
+    let _ = fs::create_dir_all(&icon_dir);
+    let icon_file = icon_dir.join("delta-rpc.png");
+    if !icon_file.exists() {
+        let _ = fs::write(&icon_file, APP_ICON_PNG);
+    }
+    icon_dir.to_str().map(|s| s.to_string())
+}
+
+fn load_tray_icon() -> Option<ksni::Icon> {
+    let decoder = png::Decoder::new(Cursor::new(APP_ICON_PNG));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let bytes = &buf[..info.buffer_size()];
+
+    let mut argb_data = Vec::with_capacity((info.width * info.height * 4) as usize);
+
+    match info.color_type {
+        png::ColorType::Rgba => {
+            for chunk in bytes.chunks_exact(4) {
+                let r = chunk[0];
+                let g = chunk[1];
+                let b = chunk[2];
+                let a = chunk[3];
+                // SNI protocol expects ARGB32 format in network byte order: [A, R, G, B]
+                argb_data.extend_from_slice(&[a, r, g, b]);
+            }
+        }
+        png::ColorType::Rgb => {
+            for chunk in bytes.chunks_exact(3) {
+                let r = chunk[0];
+                let g = chunk[1];
+                let b = chunk[2];
+                let a = 255;
+                argb_data.extend_from_slice(&[a, r, g, b]);
+            }
+        }
+        _ => return None,
+    }
+
+    Some(ksni::Icon {
+        width: info.width as i32,
+        height: info.height as i32,
+        data: argb_data,
+    })
+}
+
 // Tray icon using standard StatusNotifierItem (compatible with Wayland, X11, GNOME, KDE, Hyprland, etc.)
 struct DeltaTray {
     should_exit: Arc<AtomicBool>,
+    icon_theme_dir: String,
 }
 
 impl ksni::Tray for DeltaTray {
@@ -485,8 +545,41 @@ impl ksni::Tray for DeltaTray {
         "deltaRPC".to_string()
     }
 
+    fn category(&self) -> ksni::Category {
+        ksni::Category::ApplicationStatus
+    }
+
+    fn status(&self) -> ksni::Status {
+        ksni::Status::Active
+    }
+
     fn icon_name(&self) -> String {
-        "applications-games".to_string()
+        "delta-rpc".to_string()
+    }
+
+    fn icon_theme_path(&self) -> String {
+        self.icon_theme_dir.clone()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        match load_tray_icon() {
+            Some(icon) => vec![icon],
+            None => Vec::new(),
+        }
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::StandardItem;
+        vec![
+            StandardItem {
+                label: "Exit deltaRPC".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    tray.should_exit.store(true, Ordering::SeqCst);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        ]
     }
 
     // Clicking / activating tray icon signals to exit
@@ -712,10 +805,19 @@ fn main() {
 
     // Spawn tray icon background service
     use ksni::blocking::TrayMethods;
+    let icon_dir = ensure_icon_cache().unwrap_or_default();
     let tray = DeltaTray {
         should_exit: Arc::clone(&should_exit),
+        icon_theme_dir: icon_dir,
     };
-    let _tray_handle = tray.spawn();
+    match tray.spawn() {
+        Ok(_handle) => {
+            println!("\x1b[1;32m[+]\x1b[0m System tray icon registered successfully.");
+        }
+        Err(e) => {
+            eprintln!("\x1b[1;33m[!]\x1b[0m System tray initialization note: {e}");
+        }
+    }
 
     let mut sys = System::new();
     let mut last_detected_pid: Option<u32> = None;
