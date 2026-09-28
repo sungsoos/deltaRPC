@@ -9,10 +9,18 @@ A lightweight, zero-modification Discord Rich Presence bridge for [DELTARUNE](ht
 - **No Modding Required** | Just launch program with DELTARUNE. that's it.
 - **Lightweight** | Its lightweight (wow!)
 
+## Supported OS
+
+| OS | Supported | Notes |
+|:---|:---:|:---|
+| **Linux** | ✅ | Native support |
+| **Windows** | ❌ | Planned / In progress |
+| **macOS** | ❌ | Planned |
+
 ## Requirements
 - PC with Linux, Windows or Mac
 - Discord *desktop* client running
-- DELTARUNE
+- Steam version of DELTARUNE
 
 ## FAQ
 > Click to expand.
