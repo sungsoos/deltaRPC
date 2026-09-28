@@ -28,8 +28,67 @@ pub struct LiveGameState {
     pub room_name: Option<String>,
 }
 
+// Room friendly name mapping (assets/data/room_names.jsonc)
+const EMBEDDED_ROOM_NAMES_JSONC: &str = include_str!("../assets/data/room_names.jsonc");
+
+// Strip single-line (//) and multi-line (/* */) comments from JSONC string
+fn strip_jsonc_comments(jsonc: &str) -> String {
+    let mut out = String::with_capacity(jsonc.len());
+    let mut chars = jsonc.chars().peekable();
+    let mut in_str = false;
+    let mut escape = false;
+
+    while let Some(c) = chars.next() {
+        if escape {
+            out.push(c);
+            escape = false;
+            continue;
+        }
+        if in_str {
+            if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            out.push(c);
+            continue;
+        }
+
+        if c == '"' {
+            in_str = true;
+            out.push(c);
+        } else if c == '/' && chars.peek() == Some(&'/') {
+            chars.next(); // consume second '/'
+            for nc in chars.by_ref() {
+                if nc == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            chars.next(); // consume '*'
+            while let Some(nc) = chars.next() {
+                if nc == '*' && chars.peek() == Some(&'/') {
+                    chars.next(); // consume '/'
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+
+    out
+}
+
+// Load room name dictionary from JSONC: "<room_internal_name>": "<room_friendly_name>"
+fn load_custom_room_names() -> HashMap<String, String> {
+    let stripped = strip_jsonc_comments(EMBEDDED_ROOM_NAMES_JSONC);
+    serde_json::from_str(&stripped).unwrap_or_default()
+}
+
 // Convert GameMaker room names to Discord state string
-fn get_state(raw_room: Option<&str>, chapter: u32) -> String {
+fn get_state(raw_room: Option<&str>, chapter: u32, custom_names: &HashMap<String, String>) -> String {
     let raw = match raw_room {
         Some(r) => r,
         None => {
@@ -40,6 +99,16 @@ fn get_state(raw_room: Option<&str>, chapter: u32) -> String {
             };
         }
     };
+
+    if let Some(custom) = custom_names.get(raw) {
+        if custom.starts_with("In ") {
+            return custom.clone();
+        }
+        return match custom.as_str() {
+            "Chapter Select" | "Title Screen" | "Game Over" | "Battle" => format!("In {custom}"),
+            _ => format!("In {custom}"),
+        };
+    }
 
     let lower = raw.to_lowercase();
     if lower.contains("chapter_select") || lower.contains("place_chapter") {
@@ -76,7 +145,7 @@ fn get_state(raw_room: Option<&str>, chapter: u32) -> String {
     format!("In {}", words.join(" "))
 }
 
-// Parse room name map from data.win file
+// Fallback: Parse room name map directly from data.win file if needed (e.g. mods or future chapters)
 fn parse_rooms(data_win_path: &Path) -> HashMap<i32, String> {
     let mut rooms = HashMap::new();
     let data = match fs::read(data_win_path) {
@@ -675,6 +744,8 @@ fn main() {
     }
 
     let mut sys = System::new();
+    let custom_room_names = load_custom_room_names();
+    println!("\x1b[1;32m[+]\x1b[0m Loaded {} custom room name mappings.", custom_room_names.len());
     let mut last_detected_pid: Option<u32> = None;
     let mut cached_rooms: HashMap<i32, String> = HashMap::new();
     let mut cached_chapter: u32 = 0;
@@ -724,19 +795,21 @@ fn main() {
                     }
                 }
 
-                // Reload data.win room definitions if chapter changed or first run
+                // Load room definitions from running DELTARUNE process data.win
                 if chapter != cached_chapter || cached_rooms.is_empty() {
+                    let mut rooms = HashMap::new();
                     let cwd_link = format!("/proc/{pid}/cwd");
                     if let Ok(cwd) = fs::read_link(cwd_link) {
                         let data_win_path = cwd.join("data.win");
-                        cached_rooms = parse_rooms(&data_win_path);
-                        cached_chapter = chapter;
-                        inspector = Some(MemoryInspector::new(pid));
-                        println!(
-                            "\x1b[1;32m[+]\x1b[0m Loaded {} rooms from Chapter {chapter} data.win",
-                            cached_rooms.len()
-                        );
+                        rooms = parse_rooms(&data_win_path);
                     }
+                    cached_chapter = chapter;
+                    inspector = Some(MemoryInspector::new(pid));
+                    println!(
+                        "\x1b[1;32m[+]\x1b[0m Loaded {} rooms for Chapter {chapter}",
+                        rooms.len()
+                    );
+                    cached_rooms = rooms;
                 }
 
                 if last_detected_pid != Some(pid) {
@@ -761,7 +834,7 @@ fn main() {
                     "DELTARUNE".to_string()
                 };
 
-                let state_desc = get_state(live_room_name.as_deref(), chapter);
+                let state_desc = get_state(live_room_name.as_deref(), chapter, &custom_room_names);
 
                 let small_image_key = match chapter {
                     1 => "icon_1",

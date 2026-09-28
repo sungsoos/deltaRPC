@@ -119,6 +119,8 @@ dependencies = [
  "discord-rich-presence",
  "ksni",
  "png",
+ "serde",
+ "serde_json",
  "sysinfo",
 ]
 
