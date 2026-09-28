@@ -1,0 +1,81 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux Binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deltaRPC-linux-x86_64
+          path: target/release/delta-rpc
+
+  # -- Placeholders for Windows & macOS (will be activated once platform support is ported) --
+
+  # build-windows:
+  #   name: Build Windows Binary
+  #   runs-on: windows-latest
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #     - name: Setup Rust toolchain
+  #       uses: dtolnay/rust-toolchain@stable
+  #     - name: Build release executable
+  #       run: cargo build --release --locked
+  #     - name: Upload artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: deltaRPC-windows-x86_64
+  #         path: target/release/delta-rpc.exe
+
+  # build-macos-arm64:
+  #   name: Build macOS Apple Silicon (arm64) Binary
+  #   runs-on: macos-latest
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #     - name: Setup Rust toolchain
+  #       uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         targets: aarch64-apple-darwin
+  #     - name: Build release binary
+  #       run: cargo build --release --target aarch64-apple-darwin --locked
+  #     - name: Upload artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: deltaRPC-macos-arm64
+  #         path: target/aarch64-apple-darwin/release/delta-rpc
+
+  # build-macos-x86_64:
+  #   name: Build macOS Intel (x86_64) Binary
+  #   runs-on: macos-13
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #     - name: Setup Rust toolchain
+  #       uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         targets: x86_64-apple-darwin
+  #     - name: Build release binary
+  #       run: cargo build --release --target x86_64-apple-darwin --locked
+  #     - name: Upload artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: deltaRPC-macos-x86_64
+  #         path: target/x86_64-apple-darwin/release/delta-rpc
