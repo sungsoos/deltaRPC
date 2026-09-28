@@ -19,7 +19,7 @@ body:
     attributes:
       label: Steps to reproduce
       description: Please provide a list of steps to reproduce the issue.
-      placeholder: Write down the steps to reproduce the issue! ex: "1. Open game. 2. Open Discord. 3. RPC doesn't show up."
+      placeholder: "Write down the steps to reproduce the issue! ex: \"1. Open game. 2. Open Discord. 3. RPC doesn't show up.\""
     validations:
       required: true
 
@@ -28,7 +28,7 @@ body:
     attributes:
       label: Additional Information
       description: Please provide any additional information that might be helpful in diagnosing the issue.
-      placeholder: Write down any additional information! ex: "I was playing on a Mac with latest version of deltarune with korean patch installed."
+      placeholder: "Write down any additional information! ex: \"I was playing on a Mac with latest version of deltarune with korean patch installed.\""
     validations:
       required: false
 
