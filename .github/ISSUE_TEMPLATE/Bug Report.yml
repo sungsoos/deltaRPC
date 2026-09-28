@@ -10,7 +10,7 @@ body:
     attributes:
       label: What happened?
       description: Also tell us, what did you expect to happen?
-      placeholder: Write down what happened! ex: "RPC didnt show up."
+      placeholder: "Write down what happened! ex: \"RPC didnt show up.\""
     validations:
       required: true
 
