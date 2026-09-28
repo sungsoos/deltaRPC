@@ -1,0 +1,61 @@
+name: 💥 Crash Report
+description: File a crash report.
+title: "[💥]: "
+labels: ["💥 Crash"]
+assignees:
+  - sungsoos
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      placeholder: I was playing and it suddenly crashed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Please provide a list of steps to reproduce the issue.
+      placeholder: 1. Open game. 2. Play for while. 3. it crashes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: various-info
+    attributes:
+      label: Additional Information
+      description: Please provide any additional information that might be helpful in diagnosing the issue.
+      placeholder: I was playing on a endeavouros with latest version of deltarune with korean patch installed.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: What operating system are you seeing the problem on?
+      multiple: false
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Please copy and paste any relevant log output. It's not required, but it can help diagnose the issue faster.
+      render: shell
+    validations:
+      required: false
+
+  - type: upload
+    id: screenshots
+    attributes:
+      label: Upload screenshots
+      description: If applicable, add screenshots to help explain your problem.
+    validations:
+      required: false

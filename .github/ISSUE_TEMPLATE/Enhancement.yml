@@ -1,0 +1,14 @@
+name: ✨️ Enhancement
+description: I have a question.
+title: "[✨️]: "
+labels: ["✨️ Enhancement"]
+assignees:
+  - sungsoos
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What feature do you want?
+      placeholder: I want to display health.
+    validations:
+      required: true

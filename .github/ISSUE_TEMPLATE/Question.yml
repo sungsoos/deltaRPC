@@ -1,0 +1,30 @@
+name: ❓️ Question
+description: I have a question.
+title: "[❓️]: "
+labels: ["❓️ Question"]
+assignees:
+  - sungsoos
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What's the question?
+      placeholder: Does DELTARUNE needed to be latest version?
+    validations:
+      required: true
+
+  - type: upload
+    id: screenshots
+    attributes:
+      label: Upload screenshots
+      description: If applicable, add screenshots to help explain your question.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: didread
+    attributes:
+      label: I checked out [FAQ](https://github.com/sungsoos/deltaRPC#faq) and it didnt help.
+      options:
+        - label: checked
+          required: false
