@@ -26,15 +26,10 @@ pub struct LiveGameState {
     pub chapter: u32,
     pub room_id: Option<i32>,
     pub room_name: Option<String>,
-    pub in_battle: bool,
 }
 
-// Convert GameMaker room names and battle state to string
-fn get_state(raw_room: Option<&str>, in_battle: bool, chapter: u32) -> String {
-    if in_battle {
-        return "In Battle".to_string();
-    }
-
+// Convert GameMaker room names to Discord state string
+fn get_state(raw_room: Option<&str>, chapter: u32) -> String {
     let raw = match raw_room {
         Some(r) => r,
         None => {
@@ -47,14 +42,14 @@ fn get_state(raw_room: Option<&str>, in_battle: bool, chapter: u32) -> String {
     };
 
     let lower = raw.to_lowercase();
-    if lower.contains("battle") {
-        return "In Battle".to_string();
-    }
     if lower.contains("chapter_select") || lower.contains("place_chapter") {
         return "In Chapter Select".to_string();
     }
     if lower.contains("place_menu") || lower.contains("menu") || lower.contains("title") {
         return "In Title Screen".to_string();
+    }
+    if lower.contains("battle") {
+        return "In Battle".to_string();
     }
 
     let mut clean = raw.trim();
@@ -129,66 +124,11 @@ fn parse_rooms(data_win_path: &Path) -> HashMap<i32, String> {
     rooms
 }
 
-// Parse battle controller object IDs from data.win OBJT chunk
-fn parse_battle_obj(data_win_path: &Path) -> Vec<i32> {
-    let mut ids = Vec::new();
-    let data = match fs::read(data_win_path) {
-        Ok(d) => d,
-        Err(_) => return ids,
-    };
-
-    let obj_idx = match data.windows(4).position(|w| w == b"OBJT") {
-        Some(idx) => idx,
-        None => return ids,
-    };
-
-    if obj_idx + 12 > data.len() {
-        return ids;
-    }
-
-    let count = u32::from_le_bytes(data[obj_idx + 8..obj_idx + 12].try_into().unwrap()) as usize;
-    let offsets_start = obj_idx + 12;
-
-    for i in 0..count {
-        let entry_pos = offsets_start + i * 4;
-        if entry_pos + 4 > data.len() {
-            break;
-        }
-
-        let roff = u32::from_le_bytes(data[entry_pos..entry_pos + 4].try_into().unwrap()) as usize;
-        if roff + 4 > data.len() {
-            continue;
-        }
-
-        let name_ptr = u32::from_le_bytes(data[roff..roff + 4].try_into().unwrap()) as usize;
-        if name_ptr < data.len() {
-            let end = data[name_ptr..]
-                .iter()
-                .position(|&b| b == 0)
-                .map(|p| name_ptr + p)
-                .unwrap_or(data.len().min(name_ptr + 64));
-
-            if let Ok(name) = std::str::from_utf8(&data[name_ptr..end]) {
-                if name == "obj_battlecontroller"
-                    || name == "obj_tensionbar"
-                    || name == "obj_monsterparent"
-                {
-                    ids.push(i as i32);
-                }
-            }
-        }
-    }
-
-    ids
-}
-
 // Memory reader for DELTARUNE process
 struct MemoryInspector {
     pid: u32,
     mem_file: Option<File>,
     room_var_addr: Option<u64>,
-    last_battle_check: Instant,
-    cached_battle_state: bool,
 }
 
 impl MemoryInspector {
@@ -199,8 +139,6 @@ impl MemoryInspector {
             pid,
             mem_file,
             room_var_addr: None,
-            last_battle_check: Instant::now() - Duration::from_secs(10),
-            cached_battle_state: false,
         }
     }
 
@@ -333,89 +271,6 @@ impl MemoryInspector {
         file.read_exact(&mut buf).ok()?;
         Some(i32::from_le_bytes(buf))
     }
-
-    // Detect if DELTARUNE is currently in battle by scanning CInstance memory for battle controller instances
-    fn check_in_battle(&mut self, battle_obj_ids: &[i32]) -> bool {
-        if battle_obj_ids.is_empty() {
-            return false;
-        }
-
-        if self.last_battle_check.elapsed() < Duration::from_millis(800) {
-            return self.cached_battle_state;
-        }
-        self.last_battle_check = Instant::now();
-
-        let maps_path = format!("/proc/{}/maps", self.pid);
-        let maps_content = match fs::read_to_string(maps_path) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        let file = match self.ensure_file() {
-            Some(f) => f,
-            None => return false,
-        };
-
-        for line in maps_content.lines() {
-            if !line.contains("rw-p")
-                || line.contains("[heap]")
-                || line.contains("[stack]")
-                || line.contains("/usr/")
-                || line.contains("/lib")
-                || line.contains(".so")
-                || line.contains(".dll")
-                || line.contains("Proton")
-                || line.contains("DELTARUNE")
-                || line.contains("steam")
-            {
-                continue;
-            }
-
-            let mut parts = line.split_whitespace();
-            let range = match parts.next() {
-                Some(r) => r,
-                None => continue,
-            };
-            let mut range_parts = range.split('-');
-            let start = match range_parts.next().and_then(|s| u64::from_str_radix(s, 16).ok()) {
-                Some(v) => v,
-                None => continue,
-            };
-            let end = match range_parts.next().and_then(|s| u64::from_str_radix(s, 16).ok()) {
-                Some(v) => v,
-                None => continue,
-            };
-
-            let size = end.saturating_sub(start);
-            if size == 0 || size > 16 * 1024 * 1024 {
-                continue;
-            }
-
-            let mut buf = vec![0u8; size as usize];
-            if file.seek(SeekFrom::Start(start)).is_err() || file.read_exact(&mut buf).is_err() {
-                continue;
-            }
-
-            // Look for CInstance records: [obj_id (4 bytes)] [inst_id (4 bytes, 100000..900000)]
-            for &b_id in battle_obj_ids {
-                let target_bytes = b_id.to_le_bytes();
-                let mut p = 0;
-                while let Some(idx) = buf[p..].windows(4).position(|w| w == target_bytes) {
-                    let absolute_offset = p + idx;
-                    if absolute_offset + 8 <= buf.len() {
-                        let inst_id = i32::from_le_bytes(buf[absolute_offset + 4..absolute_offset + 8].try_into().unwrap());
-                        if (100_000..=999_999).contains(&inst_id) {
-                            self.cached_battle_state = true;
-                            return true;
-                        }
-                    }
-                    p += idx + 4;
-                }
-            }
-        }
-
-        self.cached_battle_state = false;
-        false
-    }
 }
 
 // Detect current chapter from process working directory
@@ -462,12 +317,12 @@ fn print_status_box(state: &LiveGameState, state_desc: &str, details_desc: &str)
     let room_id_str = state.room_id.map(|id| id.to_string()).unwrap_or_else(|| "Unknown".to_string());
     let raw_name = state.room_name.as_deref().unwrap_or("Unknown");
 
-    let _ = writeln!(handle, "\n╭═══════════════════════════════════════════════════════════════╮");
-    let _ = writeln!(handle, "║  Details       : {:<44} ║", details_desc);
-    let _ = writeln!(handle, "║  State         : {:<44} ║", state_desc);
-    let _ = writeln!(handle, "║  Room ID       : {:<44} ║", room_id_str);
-    let _ = writeln!(handle, "║  Room Code     : {:<44} ║", raw_name);
-    let _ = writeln!(handle, "╰═══════════════════════════════════════════════════════════════╯");
+    let _ = writeln!(handle, "\n╭───────────────────────────────────────────────────────────────╮");
+    let _ = writeln!(handle, "│  Details       : {:<44} │", details_desc);
+    let _ = writeln!(handle, "│  State         : {:<44} │", state_desc);
+    let _ = writeln!(handle, "│  Room ID       : {:<44} │", room_id_str);
+    let _ = writeln!(handle, "│  Room Code     : {:<44} │", raw_name);
+    let _ = writeln!(handle, "╰───────────────────────────────────────────────────────────────╯");
     let _ = handle.flush();
 }
 
@@ -822,7 +677,6 @@ fn main() {
     let mut sys = System::new();
     let mut last_detected_pid: Option<u32> = None;
     let mut cached_rooms: HashMap<i32, String> = HashMap::new();
-    let mut cached_battle_obj_ids: Vec<i32> = Vec::new();
     let mut cached_chapter: u32 = 0;
     let mut inspector: Option<MemoryInspector> = None;
     let mut discord_client: Option<DiscordIpcClient> = None;
@@ -870,19 +724,17 @@ fn main() {
                     }
                 }
 
-                // Reload data.win room and battle definitions if chapter changed or first run
+                // Reload data.win room definitions if chapter changed or first run
                 if chapter != cached_chapter || cached_rooms.is_empty() {
                     let cwd_link = format!("/proc/{pid}/cwd");
                     if let Ok(cwd) = fs::read_link(cwd_link) {
                         let data_win_path = cwd.join("data.win");
                         cached_rooms = parse_rooms(&data_win_path);
-                        cached_battle_obj_ids = parse_battle_obj(&data_win_path);
                         cached_chapter = chapter;
                         inspector = Some(MemoryInspector::new(pid));
                         println!(
-                            "\x1b[1;32m[+]\x1b[0m Loaded {} rooms, {} battle objects from Chapter {chapter} data.win",
-                            cached_rooms.len(),
-                            cached_battle_obj_ids.len()
+                            "\x1b[1;32m[+]\x1b[0m Loaded {} rooms from Chapter {chapter} data.win",
+                            cached_rooms.len()
                         );
                     }
                 }
@@ -897,13 +749,10 @@ fn main() {
                 let live_room_id = mem.read_room_id();
                 let live_room_name = live_room_id.and_then(|id| cached_rooms.get(&id).cloned());
 
-                let in_battle = mem.check_in_battle(&cached_battle_obj_ids);
-
                 let state = LiveGameState {
                     chapter,
                     room_id: live_room_id,
                     room_name: live_room_name.clone(),
-                    in_battle,
                 };
 
                 let details_desc = if chapter > 0 {
@@ -912,7 +761,7 @@ fn main() {
                     "DELTARUNE".to_string()
                 };
 
-                let state_desc = get_state(live_room_name.as_deref(), in_battle, chapter);
+                let state_desc = get_state(live_room_name.as_deref(), chapter);
 
                 let small_image_key = match chapter {
                     1 => "icon_1",
@@ -976,7 +825,6 @@ fn main() {
                     last_detected_pid = None;
                     cached_chapter = 0;
                     cached_rooms.clear();
-                    cached_battle_obj_ids.clear();
                     inspector = None;
                     start_timestamp = None;
                     last_sent_details.clear();
