@@ -346,7 +346,8 @@ impl MemoryInspector {
                     let entry_offset = idx + p;
                     if entry_offset + 16 <= buf.len() {
                         let fn_ptr = u64::from_le_bytes(buf[entry_offset + 8..entry_offset + 16].try_into().unwrap());
-                        if fn_ptr >= 0x140000000 && fn_ptr <= 0x140200000 {
+                        // GameMaker code functions are non-null 64-bit pointers
+                        if fn_ptr > 0x10000 && fn_ptr < 0x7fff_ffff_ffff {
                             let mut fn_bytes = [0u8; 24];
                             if mem_file.seek(SeekFrom::Start(fn_ptr)).is_ok()
                                 && mem_file.read_exact(&mut fn_bytes).is_ok()
@@ -457,7 +458,8 @@ impl MemoryInspector {
                     let entry_offset = idx + p;
                     if entry_offset + 16 <= buf.len() {
                         let fn_ptr = u64::from_le_bytes(buf[entry_offset + 8..entry_offset + 16].try_into().unwrap());
-                        if fn_ptr >= 0x140000000 && fn_ptr <= 0x140200000 {
+                        // GameMaker code functions are non-null 64-bit pointers (handles ASLR)
+                        if fn_ptr > 0x10000 && fn_ptr < 0x7fff_ffff_ffff {
                             let mut fn_bytes = [0u8; 24];
                             let mut fn_read = 0;
                             let fn_success = unsafe {
@@ -563,7 +565,7 @@ fn detect_chapter(pid: u32, sys: &mut System) -> u32 {
 }
 
 #[cfg(windows)]
-fn get_process_exe_path(pid: u32, sys: &mut System) -> Option<PathBuf> {
+fn get_process_exe_path(pid: u32, sys: &System) -> Option<PathBuf> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
     if handle != std::ptr::null_mut() {
         let mut buf = [0u16; 1024];
@@ -585,7 +587,6 @@ fn get_process_exe_path(pid: u32, sys: &mut System) -> Option<PathBuf> {
         }
     }
 
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     for (proc_pid, proc) in sys.processes() {
         if proc_pid.as_u32() == pid {
             if let Some(exe) = proc.exe() {
@@ -598,7 +599,7 @@ fn get_process_exe_path(pid: u32, sys: &mut System) -> Option<PathBuf> {
 }
 
 // Locate data.win file path for running DELTARUNE process
-fn get_data_win_path(pid: u32, sys: &mut System) -> Option<PathBuf> {
+fn get_data_win_path(pid: u32, sys: &System) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         let _ = sys;
@@ -631,6 +632,7 @@ fn find_pid(sys: &mut System) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
         let _ = sys;
+        let mut fallback_pid = None;
         if let Ok(entries) = fs::read_dir("/proc") {
             for entry in entries.flatten() {
                 let fname = entry.file_name();
@@ -640,26 +642,59 @@ fn find_pid(sys: &mut System) -> Option<u32> {
                         if let Ok(comm) = fs::read_to_string(comm_path) {
                             let lower = comm.trim().to_lowercase();
                             if lower == "deltarune" || lower == "deltarune.exe" || lower.starts_with("deltarune") {
-                                return Some(pid);
+                                // Prefer active chapter process if launched
+                                let cwd_link = format!("/proc/{pid}/cwd");
+                                if let Ok(cwd) = fs::read_link(cwd_link) {
+                                    let cwd_str = cwd.to_string_lossy().to_lowercase();
+                                    if cwd_str.contains("chapter") {
+                                        return Some(pid);
+                                    }
+                                }
+                                if fallback_pid.is_none() {
+                                    fallback_pid = Some(pid);
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        return fallback_pid;
     }
 
     #[cfg(windows)]
     {
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-        for (pid, proc) in sys.processes() {
-            let name = proc.name().to_string_lossy().to_lowercase();
-            if name == "deltarune.exe" || name == "deltarune" {
-                return Some(pid.as_u32());
+        let candidate_pids: Vec<u32> = sys
+            .processes()
+            .iter()
+            .filter_map(|(pid, proc)| {
+                let name = proc.name().to_string_lossy().to_lowercase();
+                if name == "deltarune.exe" || name == "deltarune" {
+                    Some(pid.as_u32())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut fallback_pid = None;
+        for pid in candidate_pids {
+            // Query process path to distinguish chapter process from launcher
+            if let Some(exe_path) = get_process_exe_path(pid, sys) {
+                let path_str = exe_path.to_string_lossy().to_lowercase();
+                if path_str.contains("chapter") {
+                    return Some(pid);
+                }
+            }
+            if fallback_pid.is_none() {
+                fallback_pid = Some(pid);
             }
         }
+        return fallback_pid;
     }
 
+    #[allow(unreachable_code)]
     None
 }
 
@@ -1170,26 +1205,21 @@ fn main() {
                     }
                 }
 
-                // Load room definitions from running DELTARUNE process data.win
-                if chapter != cached_chapter || cached_rooms.is_empty() {
+                // If process changed or chapter changed, recreate memory inspector and reload room definitions
+                if last_detected_pid != Some(pid) || chapter != cached_chapter || cached_rooms.is_empty() {
                     let mut rooms = HashMap::new();
                     if let Some(data_win_path) = get_data_win_path(pid, &mut sys) {
                         rooms = parse_rooms(&data_win_path);
                     }
-                    cached_chapter = chapter;
-                    inspector = Some(MemoryInspector::new(pid));
                     println!(
-                        "\x1b[1;32m[+]\x1b[0m Loaded {} rooms for Chapter {chapter}",
+                        "\x1b[1;32m[+]\x1b[0m Attached to DELTARUNE (PID {pid}, Chapter {chapter}, {} rooms)",
                         rooms.len()
                     );
+                    cached_chapter = chapter;
                     cached_rooms = rooms;
-                }
-
-                if last_detected_pid != Some(pid) {
                     last_detected_pid = Some(pid);
                     inspector = Some(MemoryInspector::new(pid));
                 }
-
 
                 let mem = inspector.as_mut().unwrap();
 
