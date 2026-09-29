@@ -812,6 +812,14 @@ fn get_data_win_path(pid: u32, sys: &System) -> Option<PathBuf> {
 
     #[cfg(windows)]
     {
+        if let Some(cwd_str) = get_process_cwd_windows(pid) {
+            let cwd = PathBuf::from(&cwd_str);
+            let data_win = cwd.join("data.win");
+            if data_win.exists() {
+                return Some(data_win);
+            }
+        }
+        // Fallback: use exe path parent directory
         if let Some(exe) = get_process_exe_path(pid, sys) {
             if let Some(dir) = exe.parent() {
                 let data_win = dir.join("data.win");
@@ -824,6 +832,7 @@ fn get_data_win_path(pid: u32, sys: &System) -> Option<PathBuf> {
 
     None
 }
+
 
 // Find DELTARUNE process PID
 fn find_pid(sys: &mut System) -> Option<u32> {
