@@ -1,10 +1,14 @@
 #![windows_subsystem = "windows"]
 
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, Cursor, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::fs::File;
+use std::io::{self, Cursor, IsTerminal, Write};
+#[cfg(target_os = "linux")]
+use std::io::{Read, Seek, SeekFrom};
 use std::panic;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,6 +18,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use discord_rich_presence::activity::{Activity, Assets, Timestamps};
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use sysinfo::System;
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Memory::{
+    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+};
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
 const DISCORD_APP_ID: &str = "1553962630828531742"; // PLEASE CHANGE IT PLEASE PLEASE PLEASE
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
@@ -195,12 +212,22 @@ fn parse_rooms(data_win_path: &Path) -> HashMap<i32, String> {
 
 // Memory reader for DELTARUNE process
 struct MemoryInspector {
+    #[allow(dead_code)]
     pid: u32,
+    #[cfg(target_os = "linux")]
     mem_file: Option<File>,
+    #[cfg(windows)]
+    handle: Option<HANDLE>,
     room_var_addr: Option<u64>,
 }
 
+#[cfg(windows)]
+unsafe impl Send for MemoryInspector {}
+#[cfg(windows)]
+unsafe impl Sync for MemoryInspector {}
+
 impl MemoryInspector {
+    #[cfg(target_os = "linux")]
     fn new(pid: u32) -> Self {
         let mem_path = format!("/proc/{pid}/mem");
         let mem_file = File::open(mem_path).ok();
@@ -211,6 +238,18 @@ impl MemoryInspector {
         }
     }
 
+    #[cfg(windows)]
+    fn new(pid: u32) -> Self {
+        let handle = unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid) };
+        let valid_handle = if handle == std::ptr::null_mut() { None } else { Some(handle) };
+        Self {
+            pid,
+            handle: valid_handle,
+            room_var_addr: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn ensure_file(&mut self) -> Option<&mut File> {
         if self.mem_file.is_none() {
             let mem_path = format!("/proc/{}/mem", self.pid);
@@ -220,6 +259,7 @@ impl MemoryInspector {
     }
 
     // Dynamically resolve GameMaker's global "room" integer address via the engine's built-in table
+    #[cfg(target_os = "linux")]
     fn resolve_room_address(&mut self) -> Option<u64> {
         if let Some(addr) = self.room_var_addr {
             return Some(addr);
@@ -230,8 +270,6 @@ impl MemoryInspector {
         let mem_file = self.ensure_file()?;
 
         let mut str_candidates: Vec<u64> = Vec::new();
-
-        /////////////////////////////////
 
         for line in maps_content.lines() {
             if !line.contains("rw-p") && !line.contains("r--p") {
@@ -269,8 +307,6 @@ impl MemoryInspector {
                 p += idx + 8;
             }
         }
-
-        /////////////////////////////////
 
         for s_addr in str_candidates {
             let s_bytes = s_addr.to_le_bytes();
@@ -332,6 +368,126 @@ impl MemoryInspector {
         None
     }
 
+    #[cfg(windows)]
+    fn resolve_room_address(&mut self) -> Option<u64> {
+        if let Some(addr) = self.room_var_addr {
+            return Some(addr);
+        }
+
+        let handle = self.handle?;
+        let mut regions: Vec<(u64, usize)> = Vec::new();
+        let mut cur_addr: usize = 0;
+
+        unsafe {
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            while VirtualQueryEx(
+                handle,
+                cur_addr as *const _,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+            {
+                if mbi.State == MEM_COMMIT
+                    && (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0
+                    && mbi.RegionSize > 0
+                    && mbi.RegionSize <= 32 * 1024 * 1024
+                {
+                    regions.push((mbi.BaseAddress as u64, mbi.RegionSize));
+                }
+
+                let next = (mbi.BaseAddress as usize).checked_add(mbi.RegionSize);
+                match next {
+                    Some(n) if n > cur_addr => cur_addr = n,
+                    _ => break,
+                }
+            }
+        }
+
+        let mut str_candidates: Vec<u64> = Vec::new();
+
+        for &(base, size) in &regions {
+            if size > 16 * 1024 * 1024 {
+                continue;
+            }
+            let mut buf = vec![0u8; size];
+            let mut bytes_read = 0;
+            let success = unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                    handle,
+                    base as *const _,
+                    buf.as_mut_ptr() as *mut _,
+                    size,
+                    &mut bytes_read,
+                )
+            };
+            if success == 0 || bytes_read == 0 {
+                continue;
+            }
+            buf.truncate(bytes_read);
+
+            let mut p = 0;
+            while let Some(idx) = buf[p..].windows(8).position(|w| w == b"\x00room\x00\x00\x00") {
+                str_candidates.push(base + (p + idx + 1) as u64);
+                p += idx + 8;
+            }
+        }
+
+        for s_addr in str_candidates {
+            let s_bytes = s_addr.to_le_bytes();
+
+            for &(base, size) in &regions {
+                let mut buf = vec![0u8; size];
+                let mut bytes_read = 0;
+                let success = unsafe {
+                    windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                        handle,
+                        base as *const _,
+                        buf.as_mut_ptr() as *mut _,
+                        size,
+                        &mut bytes_read,
+                    )
+                };
+                if success == 0 || bytes_read == 0 {
+                    continue;
+                }
+                buf.truncate(bytes_read);
+
+                let mut idx = 0;
+                while let Some(p) = buf[idx..].windows(8).position(|w| w == s_bytes) {
+                    let entry_offset = idx + p;
+                    if entry_offset + 16 <= buf.len() {
+                        let fn_ptr = u64::from_le_bytes(buf[entry_offset + 8..entry_offset + 16].try_into().unwrap());
+                        if fn_ptr >= 0x140000000 && fn_ptr <= 0x140200000 {
+                            let mut fn_bytes = [0u8; 24];
+                            let mut fn_read = 0;
+                            let fn_success = unsafe {
+                                windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                                    handle,
+                                    fn_ptr as *const _,
+                                    fn_bytes.as_mut_ptr() as *mut _,
+                                    fn_bytes.len(),
+                                    &mut fn_read,
+                                )
+                            };
+                            if fn_success != 0 && fn_read == 24 {
+                                if let Some(op_pos) = fn_bytes.windows(4).position(|w| w == [0x66, 0x0f, 0x6e, 0x05]) {
+                                    let rel = i32::from_le_bytes(fn_bytes[op_pos + 4..op_pos + 8].try_into().unwrap());
+                                    let target_addr = (fn_ptr as i64 + op_pos as i64 + 8 + rel as i64) as u64;
+                                    self.room_var_addr = Some(target_addr);
+                                    return Some(target_addr);
+                                }
+                            }
+                        }
+                    }
+                    idx += p + 8;
+                }
+            }
+        }
+
+        None
+    }
+
+    #[cfg(target_os = "linux")]
     fn read_room_id(&mut self) -> Option<i32> {
         let addr = self.resolve_room_address()?;
         let file = self.ensure_file()?;
@@ -340,16 +496,65 @@ impl MemoryInspector {
         file.read_exact(&mut buf).ok()?;
         Some(i32::from_le_bytes(buf))
     }
+
+    #[cfg(windows)]
+    fn read_room_id(&mut self) -> Option<i32> {
+        let addr = self.resolve_room_address()?;
+        let handle = self.handle?;
+        let mut buf = [0u8; 4];
+        let mut bytes_read = 0;
+        let success = unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                handle,
+                addr as *const _,
+                buf.as_mut_ptr() as *mut _,
+                4,
+                &mut bytes_read,
+            )
+        };
+        if success != 0 && bytes_read == 4 {
+            Some(i32::from_le_bytes(buf))
+        } else {
+            None
+        }
+    }
 }
 
-// Detect current chapter from process working directory
-fn detect_chapter(pid: u32) -> u32 {
-    let cwd_link = format!("/proc/{pid}/cwd");
-    if let Ok(target) = fs::read_link(cwd_link) {
-        let path_str = target.to_string_lossy();
-        for ch in 1..=7 {
-            if path_str.contains(&format!("chapter{ch}")) {
-                return ch;
+#[cfg(windows)]
+impl Drop for MemoryInspector {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle {
+            unsafe {
+                CloseHandle(h);
+            }
+        }
+    }
+}
+
+// Detect current chapter from process working directory or executable path
+fn detect_chapter(pid: u32, sys: &mut System) -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = sys;
+        let cwd_link = format!("/proc/{pid}/cwd");
+        if let Ok(target) = fs::read_link(cwd_link) {
+            let path_str = target.to_string_lossy();
+            for ch in 1..=7 {
+                if path_str.contains(&format!("chapter{ch}")) {
+                    return ch;
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(exe_path) = get_process_exe_path(pid, sys) {
+            let path_str = exe_path.to_string_lossy().to_lowercase();
+            for ch in 1..=7 {
+                if path_str.contains(&format!("chapter{ch}")) {
+                    return ch;
+                }
             }
         }
     }
@@ -357,20 +562,62 @@ fn detect_chapter(pid: u32) -> u32 {
     0
 }
 
-// Find DELTARUNE process PID from /proc/
-fn find_pid(_sys: &mut System) -> Option<u32> {
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let fname = entry.file_name();
-            if let Some(pid_str) = fname.to_str() {
-                if let Ok(pid) = pid_str.parse::<u32>() {
-                    let comm_path = format!("/proc/{pid}/comm");
-                    if let Ok(comm) = fs::read_to_string(comm_path) {
-                        let lower = comm.trim().to_lowercase();
-                        if lower == "deltarune" || lower == "deltarune.exe" || lower.starts_with("deltarune") {
-                            return Some(pid);
-                        }
-                    }
+#[cfg(windows)]
+fn get_process_exe_path(pid: u32, sys: &mut System) -> Option<PathBuf> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+    if handle != std::ptr::null_mut() {
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let len = unsafe {
+            QueryFullProcessImageNameW(
+                handle,
+                0,
+                buf.as_mut_ptr(),
+                &mut size,
+            )
+        };
+        unsafe { CloseHandle(handle) };
+        if len != 0 && size > 0 {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+            let os_str = OsString::from_wide(&buf[..size as usize]);
+            return Some(PathBuf::from(os_str));
+        }
+    }
+
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    for (proc_pid, proc) in sys.processes() {
+        if proc_pid.as_u32() == pid {
+            if let Some(exe) = proc.exe() {
+                return Some(exe.to_path_buf());
+            }
+        }
+    }
+
+    None
+}
+
+// Locate data.win file path for running DELTARUNE process
+fn get_data_win_path(pid: u32, sys: &mut System) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = sys;
+        let cwd_link = format!("/proc/{pid}/cwd");
+        if let Ok(cwd) = fs::read_link(cwd_link) {
+            let data_win = cwd.join("data.win");
+            if data_win.exists() {
+                return Some(data_win);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(exe) = get_process_exe_path(pid, sys) {
+            if let Some(dir) = exe.parent() {
+                let data_win = dir.join("data.win");
+                if data_win.exists() {
+                    return Some(data_win);
                 }
             }
         }
@@ -378,6 +625,44 @@ fn find_pid(_sys: &mut System) -> Option<u32> {
 
     None
 }
+
+// Find DELTARUNE process PID
+fn find_pid(sys: &mut System) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = sys;
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                if let Some(pid_str) = fname.to_str() {
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        let comm_path = format!("/proc/{pid}/comm");
+                        if let Ok(comm) = fs::read_to_string(comm_path) {
+                            let lower = comm.trim().to_lowercase();
+                            if lower == "deltarune" || lower == "deltarune.exe" || lower.starts_with("deltarune") {
+                                return Some(pid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        for (pid, proc) in sys.processes() {
+            let name = proc.name().to_string_lossy().to_lowercase();
+            if name == "deltarune.exe" || name == "deltarune" {
+                return Some(pid.as_u32());
+            }
+        }
+    }
+
+    None
+}
+
 
 fn print_status_box(state: &LiveGameState, state_desc: &str, details_desc: &str) {
     let stdout = io::stdout();
@@ -399,6 +684,7 @@ fn print_status_box(state: &LiveGameState, state_desc: &str, details_desc: &str)
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/img/app/icon.png");
 
 // Ensure embedded icon is written to a reliable cache path for hosts using icon_theme_path
+#[cfg(target_os = "linux")]
 fn ensure_icon_cache() -> Option<String> {
     let base = std::env::var("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
@@ -415,6 +701,7 @@ fn ensure_icon_cache() -> Option<String> {
     icon_dir.to_str().map(|s| s.to_string())
 }
 
+#[cfg(target_os = "linux")]
 fn load_tray_icon() -> Option<ksni::Icon> {
     let decoder = png::Decoder::new(Cursor::new(APP_ICON_PNG));
     let mut reader = decoder.read_info().ok()?;
@@ -455,11 +742,13 @@ fn load_tray_icon() -> Option<ksni::Icon> {
 }
 
 // Tray icon using standard StatusNotifierItem (compatible with Wayland, X11, GNOME, KDE, Hyprland, etc.)
+#[cfg(target_os = "linux")]
 struct DeltaTray {
     should_exit: Arc<AtomicBool>,
     icon_theme_dir: String,
 }
 
+#[cfg(target_os = "linux")]
 impl ksni::Tray for DeltaTray {
     fn id(&self) -> String {
         "delta-rpc".to_string()
@@ -513,6 +802,30 @@ impl ksni::Tray for DeltaTray {
     }
 }
 
+// Load RGBA icon for Windows tray-icon crate
+#[cfg(windows)]
+fn load_win_tray_icon() -> Option<tray_icon::Icon> {
+    let decoder = png::Decoder::new(Cursor::new(APP_ICON_PNG));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let bytes = &buf[..info.buffer_size()];
+
+    let rgba_data = match info.color_type {
+        png::ColorType::Rgba => bytes.to_vec(),
+        png::ColorType::Rgb => {
+            let mut rgba = Vec::with_capacity((info.width * info.height * 4) as usize);
+            for chunk in bytes.chunks_exact(3) {
+                rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+            rgba
+        }
+        _ => return None,
+    };
+
+    tray_icon::Icon::from_rgba(rgba_data, info.width, info.height).ok()
+}
+
 // Display error message box using system dialog
 fn show_error_dialog(title: &str, message: &str) {
     #[cfg(target_os = "linux")]
@@ -562,20 +875,17 @@ fn show_error_dialog(title: &str, message: &str) {
             .status();
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     {
-        use std::ffi::CString;
-        // Basic Windows MessageBox fallback via powershell if native win32 api not linked
-        let _ = Command::new("powershell")
-            .arg("-Command")
-            .arg(format!(
-                "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms'); [System.Windows.Forms.MessageBox]::Show('{}', '{}')",
-                message.replace("'", "''"),
-                title.replace("'", "''")
-            ))
-            .status();
+        use std::os::windows::ffi::OsStrExt;
+        let wide_title: Vec<u16> = std::ffi::OsStr::new(title).encode_wide().chain(std::iter::once(0)).collect();
+        let wide_msg: Vec<u16> = std::ffi::OsStr::new(message).encode_wide().chain(std::iter::once(0)).collect();
+        unsafe {
+            MessageBoxW(std::ptr::null_mut(), wide_msg.as_ptr(), wide_title.as_ptr(), MB_OK | MB_ICONERROR);
+        }
     }
 }
+
 
 // Automatically copy error log to system clipboard (Wayland, X11, or Windows)
 fn copy_to_clipboard(text: &str) {
@@ -681,6 +991,7 @@ fn ctrl_del() {
         return;
     }
 
+    #[cfg(target_os = "linux")]
     thread::spawn(|| {
         println!("\x1b[1;33m[!]\x1b[0m CrashOnCtrlDel is ENABLED. Monitoring input devices for Ctrl + Delete...");
 
@@ -717,6 +1028,7 @@ fn ctrl_del() {
     });
 }
 
+
 fn main() {
     setup_crash_handler();
     ctrl_del();
@@ -728,19 +1040,82 @@ fn main() {
     let should_exit = Arc::new(AtomicBool::new(false));
 
     // Spawn tray icon background service
-    use ksni::blocking::TrayMethods;
-    let icon_dir = ensure_icon_cache().unwrap_or_default();
-    let tray = DeltaTray {
-        should_exit: Arc::clone(&should_exit),
-        icon_theme_dir: icon_dir,
-    };
-    match tray.spawn() {
-        Ok(_handle) => {
-            println!("\x1b[1;32m[+]\x1b[0m System tray icon registered successfully.");
+    #[cfg(target_os = "linux")]
+    {
+        use ksni::blocking::TrayMethods;
+        let icon_dir = ensure_icon_cache().unwrap_or_default();
+        let tray = DeltaTray {
+            should_exit: Arc::clone(&should_exit),
+            icon_theme_dir: icon_dir,
+        };
+        match tray.spawn() {
+            Ok(_handle) => {
+                println!("\x1b[1;32m[+]\x1b[0m System tray icon registered successfully.");
+            }
+            Err(e) => {
+                eprintln!("\x1b[1;33m[!]\x1b[0m System tray initialization note: {e}");
+            }
         }
-        Err(e) => {
-            eprintln!("\x1b[1;33m[!]\x1b[0m System tray initialization note: {e}");
-        }
+    }
+
+    #[cfg(windows)]
+    {
+        let exit_flag = Arc::clone(&should_exit);
+        thread::spawn(move || {
+            let icon = load_win_tray_icon();
+            let mut builder = tray_icon::TrayIconBuilder::new()
+                .with_tooltip("deltaRPC");
+
+            if let Some(i) = icon {
+                builder = builder.with_icon(i);
+            }
+
+            let tray = match builder.build() {
+                Ok(t) => {
+                    println!("\x1b[1;32m[+]\x1b[0m System tray icon registered successfully.");
+                    Some(t)
+                }
+                Err(e) => {
+                    eprintln!("\x1b[1;33m[!]\x1b[0m System tray initialization note: {e}");
+                    None
+                }
+            };
+
+            let tray_channel = tray_icon::TrayIconEvent::receiver();
+            while !exit_flag.load(Ordering::SeqCst) {
+                unsafe {
+                    let mut msg = std::mem::zeroed();
+                    while windows_sys::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                        &mut msg,
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        windows_sys::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+                    ) != 0
+                    {
+                        windows_sys::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                        windows_sys::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+                    }
+                }
+
+
+                while let Ok(event) = tray_channel.try_recv() {
+                    match event {
+                        tray_icon::TrayIconEvent::Click { button: tray_icon::MouseButton::Left, .. }
+                        | tray_icon::TrayIconEvent::DoubleClick { .. } => {
+                            println!("\x1b[1;33m[!]\x1b[0m Tray icon activated. Exiting deltaRPC...");
+                            exit_flag.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                sleep(Duration::from_millis(50));
+            }
+
+            drop(tray);
+        });
     }
 
     let mut sys = System::new();
@@ -764,7 +1139,7 @@ fn main() {
 
         match game_pid {
             Some(pid) => {
-                let chapter = detect_chapter(pid);
+                let chapter = detect_chapter(pid, &mut sys);
 
                 // Initialize start timestamp when game is first detected
                 if start_timestamp.is_none() {
@@ -798,9 +1173,7 @@ fn main() {
                 // Load room definitions from running DELTARUNE process data.win
                 if chapter != cached_chapter || cached_rooms.is_empty() {
                     let mut rooms = HashMap::new();
-                    let cwd_link = format!("/proc/{pid}/cwd");
-                    if let Ok(cwd) = fs::read_link(cwd_link) {
-                        let data_win_path = cwd.join("data.win");
+                    if let Some(data_win_path) = get_data_win_path(pid, &mut sys) {
                         rooms = parse_rooms(&data_win_path);
                     }
                     cached_chapter = chapter;
@@ -816,6 +1189,7 @@ fn main() {
                     last_detected_pid = Some(pid);
                     inspector = Some(MemoryInspector::new(pid));
                 }
+
 
                 let mem = inspector.as_mut().unwrap();
 

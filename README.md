@@ -14,7 +14,7 @@ A lightweight, zero-modification Discord Rich Presence bridge for [DELTARUNE](ht
 | OS | Supported | Notes |
 |:---|:---:|:---|
 | **Linux** | ✅ | Native support |
-| **Windows** | ❌ | Planned / In progress |
+| **Windows** | ⚠️ | Experimental Support |
 | **macOS** | ❌ | Planned |
 
 ## Requirements
