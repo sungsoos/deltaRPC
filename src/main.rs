@@ -1,5 +1,3 @@
-#![windows_subsystem = "windows"]
-
 use std::collections::HashMap;
 use std::fs;
 #[cfg(target_os = "linux")]
@@ -963,7 +961,7 @@ fn copy_to_clipboard(text: &str) {
         }
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     {
         if let Ok(mut child) = Command::new("clip")
             .stdin(Stdio::piped())
