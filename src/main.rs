@@ -15,11 +15,11 @@ use discord_rich_presence::activity::{Activity, Assets, Timestamps};
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use sysinfo::System;
 
-const DISCORD_APP_ID: &str = "1553962630828531742";
+const DISCORD_APP_ID: &str = "1553962630828531742"; // PLEASE CHANGE IT PLEASE PLEASE PLEASE
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 #[allow(non_upper_case_globals)]
-pub const CrashOnCtrlDel: bool = true;
+pub const CrashOnCtrlDel: bool = false;
 
 #[derive(Debug, Clone, Default)]
 pub struct LiveGameState {
