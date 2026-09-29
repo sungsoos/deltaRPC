@@ -14,7 +14,7 @@ A lightweight, zero-modification Discord Rich Presence bridge for [DELTARUNE](ht
 | OS | Supported | Notes |
 |:---|:---:|:---|
 | **Linux** | ✅ | Native support |
-| **Windows** | ⚠️ | Experimental Support |
+| **Windows** | ✅ | Experimental Support |
 | **macOS** | ❌ | Planned |
 
 ## Requirements
@@ -60,4 +60,3 @@ no. sorry. you didn't buy the game.
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
-<!-- I write very like ai, huh? -->
