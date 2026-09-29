@@ -583,15 +583,16 @@ fn detect_chapter(pid: u32, sys: &mut System) -> u32 {
 
     #[cfg(windows)]
     {
-        if let Some(exe_name) = get_exe_name_from_snapshot(pid) {
-            let lower = exe_name.to_lowercase();
+        // Primary: read actual CWD from PEB via NtQueryInformationProcess + ReadProcessMemory
+        if let Some(cwd) = get_process_cwd_windows(pid) {
+            let lower = cwd.to_lowercase();
             for ch in 1..=7 {
                 if lower.contains(&format!("chapter{ch}")) {
                     return ch;
                 }
             }
         }
-        // Fallback: QueryFullProcessImageNameW via OpenProcess
+        // Fallback: QueryFullProcessImageNameW (full exe path includes chapter folder)
         if let Some(exe_path) = get_process_exe_path(pid, sys) {
             let path_str = exe_path.to_string_lossy().to_lowercase();
             for ch in 1..=7 {
@@ -600,54 +601,135 @@ fn detect_chapter(pid: u32, sys: &mut System) -> u32 {
                 }
             }
         }
-        // Last resort: sysinfo cwd (may be None on Windows)
-        for (proc_pid, proc) in sys.processes() {
-            if proc_pid.as_u32() == pid {
-                if let Some(cwd) = proc.cwd() {
-                    let cwd_str = cwd.to_string_lossy().to_lowercase();
-                    for ch in 1..=7 {
-                        if cwd_str.contains(&format!("chapter{ch}")) {
-                            return ch;
-                        }
-                    }
-                }
-                break;
-            }
-        }
     }
 
     0
 }
 
-// Read exe file name for a PID via CreateToolhelp32Snapshot (no OpenProcess needed)
+
+// Read the current working directory of a process via PEB + ReadProcessMemory.
+// Uses NtQueryInformationProcess (loaded from ntdll at runtime) to find the PEB,
+// then reads RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.Buffer from the target process.
 #[cfg(windows)]
-fn get_exe_name_from_snapshot(target_pid: u32) -> Option<String> {
+fn get_process_cwd_windows(pid: u32) -> Option<String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
-    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+    // Open process with enough rights to query info and read memory
+    let handle = unsafe {
+        OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid)
+    };
+    if handle.is_null() {
         return None;
     }
 
-    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-    let mut found = None;
-    if unsafe { Process32FirstW(snap, &mut entry) } != 0 {
-        loop {
-            if entry.th32ProcessID == target_pid {
-                let nul = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
-                found = Some(OsString::from_wide(&entry.szExeFile[..nul]).to_string_lossy().into_owned());
-                break;
-            }
-            if unsafe { Process32NextW(snap, &mut entry) } == 0 {
-                break;
-            }
-        }
+    // Dynamically load NtQueryInformationProcess from ntdll
+    type NtQueryFn = unsafe extern "system" fn(
+        HANDLE, u32, *mut u8, u32, *mut u32,
+    ) -> i32;
+    let ntdll = unsafe {
+        windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(
+            b"ntdll.dll\0".as_ptr()
+        )
+    };
+    if ntdll == std::ptr::null_mut() {
+        unsafe { CloseHandle(handle) };
+        return None;
     }
-    unsafe { windows_sys::Win32::Foundation::CloseHandle(snap) };
-    found
+    let proc_addr = unsafe {
+        windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+            ntdll,
+            b"NtQueryInformationProcess\0".as_ptr(),
+        )
+    };
+    let nt_query: NtQueryFn = unsafe { std::mem::transmute(proc_addr?) };
+
+    #[repr(C)]
+    struct ProcessBasicInfo {
+        reserved0: usize,
+        peb_base: usize,
+        reserved1: usize,
+        reserved2: usize,
+        unique_pid: usize,
+        reserved3: usize,
+    }
+    let mut pbi: ProcessBasicInfo = unsafe { std::mem::zeroed() };
+    let mut ret_len: u32 = 0;
+    let status = unsafe {
+        nt_query(
+            handle,
+            0, // ProcessBasicInformation
+            &mut pbi as *mut _ as *mut u8,
+            std::mem::size_of::<ProcessBasicInfo>() as u32,
+            &mut ret_len,
+        )
+    };
+    if status < 0 || pbi.peb_base == 0 {
+        unsafe { CloseHandle(handle) };
+        return None;
+    }
+
+    let mut proc_params_ptr: usize = 0;
+    let mut read: usize = 0;
+    let ok = unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+            handle,
+            (pbi.peb_base + 0x20) as *const _,
+            &mut proc_params_ptr as *mut _ as *mut _,
+            8,
+            &mut read,
+        )
+    };
+    if ok == 0 || read != 8 || proc_params_ptr == 0 {
+        unsafe { CloseHandle(handle) };
+        return None;
+    }
+
+    // RTL_USER_PROCESS_PARAMETERS.CurrentDirectory is at offset 0x38 on 64-bit.
+    // Layout: UNICODE_STRING { Length: u16, MaxLength: u16, _pad: u32, Buffer: *u16 }
+    // Total size of that sub-struct = 16 bytes. Length is the first u16.
+    let mut cur_dir: [u8; 16] = [0u8; 16];
+    let ok = unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+            handle,
+            (proc_params_ptr + 0x38) as *const _,
+            cur_dir.as_mut_ptr() as *mut _,
+            16,
+            &mut read,
+        )
+    };
+    if ok == 0 || read < 16 {
+        unsafe { CloseHandle(handle) };
+        return None;
+    }
+
+    let length = u16::from_le_bytes([cur_dir[0], cur_dir[1]]) as usize; // bytes, not chars
+    let buf_ptr = usize::from_le_bytes(cur_dir[8..16].try_into().unwrap());
+
+    if length == 0 || buf_ptr == 0 {
+        unsafe { CloseHandle(handle) };
+        return None;
+    }
+
+    // Read the actual wide-char path string
+    let char_count = length / 2;
+    let mut wide_buf = vec![0u16; char_count];
+    let ok = unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+            handle,
+            buf_ptr as *const _,
+            wide_buf.as_mut_ptr() as *mut _,
+            length,
+            &mut read,
+        )
+    };
+    unsafe { CloseHandle(handle) };
+
+    if ok == 0 || read < length {
+        return None;
+    }
+
+    Some(OsString::from_wide(&wide_buf).to_string_lossy().into_owned())
 }
 
 
