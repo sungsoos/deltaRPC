@@ -25,7 +25,8 @@ use windows_sys::Win32::System::Memory::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_VM_READ,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
@@ -100,6 +101,34 @@ fn strip_jsonc_comments(jsonc: &str) -> String {
 fn load_custom_room_names() -> HashMap<String, String> {
     let stripped = strip_jsonc_comments(EMBEDDED_ROOM_NAMES_JSONC);
     serde_json::from_str(&stripped).unwrap_or_default()
+}
+
+// Map each room name to its chapter (1..=5, or 0 for launcher) by reading JSONC section comments
+fn load_room_chapter_map() -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+    let mut current_ch: u32 = 0;
+
+    for line in EMBEDDED_ROOM_NAMES_JSONC.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            let comment = trimmed.trim_start_matches('/').trim().to_lowercase();
+            if comment.contains("launcher") {
+                current_ch = 0;
+            } else if let Some(pos) = comment.find("chapter") {
+                let rest = &comment[pos + 7..].trim();
+                if let Some(digit) = rest.chars().next().and_then(|c| c.to_digit(10)) {
+                    current_ch = digit;
+                }
+            }
+        } else if trimmed.starts_with('"') {
+            if let Some(end_quote) = trimmed[1..].find('"') {
+                let room_key = &trimmed[1..1 + end_quote];
+                map.insert(room_key.to_string(), current_ch);
+            }
+        }
+    }
+
+    map
 }
 
 // Convert GameMaker room names to Discord state string
@@ -549,12 +578,27 @@ fn detect_chapter(pid: u32, sys: &mut System) -> u32 {
 
     #[cfg(windows)]
     {
+        // Check exe path first
         if let Some(exe_path) = get_process_exe_path(pid, sys) {
             let path_str = exe_path.to_string_lossy().to_lowercase();
             for ch in 1..=7 {
                 if path_str.contains(&format!("chapter{ch}")) {
                     return ch;
                 }
+            }
+        }
+        // Fallback: check working directory reported by sysinfo
+        for (proc_pid, proc) in sys.processes() {
+            if proc_pid.as_u32() == pid {
+                if let Some(cwd) = proc.cwd() {
+                    let cwd_str = cwd.to_string_lossy().to_lowercase();
+                    for ch in 1..=7 {
+                        if cwd_str.contains(&format!("chapter{ch}")) {
+                            return ch;
+                        }
+                    }
+                }
+                break;
             }
         }
     }
@@ -564,31 +608,60 @@ fn detect_chapter(pid: u32, sys: &mut System) -> u32 {
 
 #[cfg(windows)]
 fn get_process_exe_path(pid: u32, sys: &System) -> Option<PathBuf> {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
-    if handle != std::ptr::null_mut() {
-        let mut buf = [0u16; 1024];
-        let mut size = buf.len() as u32;
-        let len = unsafe {
-            QueryFullProcessImageNameW(
-                handle,
-                0,
-                buf.as_mut_ptr(),
-                &mut size,
-            )
-        };
-        unsafe { CloseHandle(handle) };
-        if len != 0 && size > 0 {
-            use std::ffi::OsString;
-            use std::os::windows::ffi::OsStringExt;
-            let os_str = OsString::from_wide(&buf[..size as usize]);
-            return Some(PathBuf::from(os_str));
+    // Try PROCESS_QUERY_LIMITED_INFORMATION (0x1000) first as it doesn't require PROCESS_VM_READ
+    // and succeeds across integrity/session boundaries for reading process image names.
+    let access_rights = [
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_QUERY_INFORMATION,
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+    ];
+
+    for rights in access_rights {
+        let handle = unsafe { OpenProcess(rights, 0, pid) };
+        if handle != std::ptr::null_mut() {
+            let mut buf = [0u16; 1024];
+            let mut size = buf.len() as u32;
+            let len = unsafe {
+                QueryFullProcessImageNameW(
+                    handle,
+                    0,
+                    buf.as_mut_ptr(),
+                    &mut size,
+                )
+            };
+            unsafe { CloseHandle(handle) };
+            if len != 0 && size > 0 {
+                use std::ffi::OsString;
+                use std::os::windows::ffi::OsStringExt;
+                let os_str = OsString::from_wide(&buf[..size as usize]);
+                let path = PathBuf::from(os_str);
+                if path.exists() || path.extension().is_some() {
+                    return Some(path);
+                }
+            }
         }
     }
 
+    // Fallback: check sysinfo process information
     for (proc_pid, proc) in sys.processes() {
         if proc_pid.as_u32() == pid {
             if let Some(exe) = proc.exe() {
-                return Some(exe.to_path_buf());
+                if !exe.as_os_str().is_empty() {
+                    return Some(exe.to_path_buf());
+                }
+            }
+            if let Some(cwd) = proc.cwd() {
+                let candidate = cwd.join("DELTARUNE.exe");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+                return Some(cwd.to_path_buf());
+            }
+            if let Some(cmd0) = proc.cmd().first() {
+                let path = PathBuf::from(cmd0);
+                if path.exists() {
+                    return Some(path);
+                }
             }
         }
     }
@@ -1153,6 +1226,7 @@ fn main() {
 
     let mut sys = System::new();
     let custom_room_names = load_custom_room_names();
+    let room_chapter_map = load_room_chapter_map();
     println!("\x1b[1;32m[+]\x1b[0m Loaded {} custom room name mappings.", custom_room_names.len());
     let mut last_detected_pid: Option<u32> = None;
     let mut cached_rooms: HashMap<i32, String> = HashMap::new();
@@ -1172,7 +1246,7 @@ fn main() {
 
         match game_pid {
             Some(pid) => {
-                let chapter = detect_chapter(pid, &mut sys);
+                let mut chapter = detect_chapter(pid, &mut sys);
 
                 // Initialize start timestamp when game is first detected
                 if start_timestamp.is_none() {
@@ -1223,6 +1297,18 @@ fn main() {
 
                 let live_room_id = mem.read_room_id();
                 let live_room_name = live_room_id.and_then(|id| cached_rooms.get(&id).cloned());
+
+                // Infer chapter from live room name if detect_chapter returned 0
+                if chapter == 0 {
+                    if let Some(ref rname) = live_room_name {
+                        if let Some(&ch) = room_chapter_map.get(rname) {
+                            if ch > 0 {
+                                chapter = ch;
+                                cached_chapter = ch;
+                            }
+                        }
+                    }
+                }
 
                 let state = LiveGameState {
                     chapter,
