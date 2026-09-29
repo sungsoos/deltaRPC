@@ -30,6 +30,11 @@ use windows_sys::Win32::System::Threading::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+#[cfg(windows)]
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
+    PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 
 const DISCORD_APP_ID: &str = "1553962630828531742"; // PLEASE CHANGE IT PLEASE PLEASE PLEASE
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
@@ -578,7 +583,15 @@ fn detect_chapter(pid: u32, sys: &mut System) -> u32 {
 
     #[cfg(windows)]
     {
-        // Check exe path first
+        if let Some(exe_name) = get_exe_name_from_snapshot(pid) {
+            let lower = exe_name.to_lowercase();
+            for ch in 1..=7 {
+                if lower.contains(&format!("chapter{ch}")) {
+                    return ch;
+                }
+            }
+        }
+        // Fallback: QueryFullProcessImageNameW via OpenProcess
         if let Some(exe_path) = get_process_exe_path(pid, sys) {
             let path_str = exe_path.to_string_lossy().to_lowercase();
             for ch in 1..=7 {
@@ -587,7 +600,7 @@ fn detect_chapter(pid: u32, sys: &mut System) -> u32 {
                 }
             }
         }
-        // Fallback: check working directory reported by sysinfo
+        // Last resort: sysinfo cwd (may be None on Windows)
         for (proc_pid, proc) in sys.processes() {
             if proc_pid.as_u32() == pid {
                 if let Some(cwd) = proc.cwd() {
@@ -605,6 +618,38 @@ fn detect_chapter(pid: u32, sys: &mut System) -> u32 {
 
     0
 }
+
+// Read exe file name for a PID via CreateToolhelp32Snapshot (no OpenProcess needed)
+#[cfg(windows)]
+fn get_exe_name_from_snapshot(target_pid: u32) -> Option<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+    let mut found = None;
+    if unsafe { Process32FirstW(snap, &mut entry) } != 0 {
+        loop {
+            if entry.th32ProcessID == target_pid {
+                let nul = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+                found = Some(OsString::from_wide(&entry.szExeFile[..nul]).to_string_lossy().into_owned());
+                break;
+            }
+            if unsafe { Process32NextW(snap, &mut entry) } == 0 {
+                break;
+            }
+        }
+    }
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(snap) };
+    found
+}
+
 
 #[cfg(windows)]
 fn get_process_exe_path(pid: u32, sys: &System) -> Option<PathBuf> {
@@ -751,7 +796,7 @@ fn find_pid(sys: &mut System) -> Option<u32> {
 
         let mut fallback_pid = None;
         for pid in candidate_pids {
-            // Query process path to distinguish chapter process from launcher
+            // Try QueryFullProcessImageNameW first (full path with chapter folder)
             if let Some(exe_path) = get_process_exe_path(pid, sys) {
                 let path_str = exe_path.to_string_lossy().to_lowercase();
                 if path_str.contains("chapter") {
@@ -762,6 +807,42 @@ fn find_pid(sys: &mut System) -> Option<u32> {
                 fallback_pid = Some(pid);
             }
         }
+
+        // Fallback: scan all DELTARUNE.exe processes via snapshot (works without OpenProcess)
+        // Check the full path from QueryFullProcessImageNameW by re-trying all PIDs found in snapshot
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+            let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if unsafe { Process32FirstW(snap, &mut entry) } != 0 {
+                loop {
+                    let nul = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+                    let exe_name = OsString::from_wide(&entry.szExeFile[..nul]).to_string_lossy().to_lowercase();
+                    if exe_name == "deltarune.exe" || exe_name == "deltarune" {
+                        let pid = entry.th32ProcessID;
+                        // Try to read full path to detect chapter folder
+                        let sys2 = System::new();
+                        if let Some(path) = get_process_exe_path(pid, &sys2) {
+                            let path_str = path.to_string_lossy().to_lowercase();
+                            if path_str.contains("chapter") {
+                                unsafe { windows_sys::Win32::Foundation::CloseHandle(snap) };
+                                return Some(pid);
+                            }
+                        }
+                        if fallback_pid.is_none() {
+                            fallback_pid = Some(pid);
+                        }
+                    }
+                    if unsafe { Process32NextW(snap, &mut entry) } == 0 {
+                        break;
+                    }
+                }
+            }
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(snap) };
+        }
+
         return fallback_pid;
     }
 
