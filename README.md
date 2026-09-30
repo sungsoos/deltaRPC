@@ -1,4 +1,10 @@
 # deltaRPC
+<div align="center"><picture>
+<img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust">
+<img src="https://img.shields.io/github/issues/sungsoos/deltaRPC.svg?style=for-the-badge" alt="Open Issues">
+<img src="https://img.shields.io/github/issues-pr/sungsoos/deltaRPC.svg?style=for-the-badge" alt="Open PRs">
+</picture></div>
+
 > [!WARNING]
 > This program is on development. Except few amounts of bugs.
 
